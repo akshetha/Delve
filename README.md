@@ -20,7 +20,7 @@ python3 delve.py
 When you see `Delve is running`, open [http://127.0.0.1:8000](http://127.0.0.1:8000)
 in your browser. Stop the app at any time with `Ctrl+C` in the terminal.
 
-## Optional news API keys
+## Optional: API keys
 
 Delve works without API keys for price history and public news links. To add
 provider-backed news and sentiment data, copy `.env.example` to `.env` and add
@@ -41,7 +41,8 @@ private; it is intentionally excluded from version control. Keep your keys safe.
   difference needs a manual check.
 - Recent news, available public-article summaries, and linked publisher
   commentary.
-- Optional Alpha Vantage and Finnhub news data when their API keys are set.
+- Optional Alpha Vantage and Finnhub news data when their API keys are set (reccomended).
+- Remember: This is a learning tool.
 
 ## A note on the projection
 
