@@ -14,10 +14,15 @@ import json
 import math
 import os
 import re
+import sqlite3
+import sys
+import time
+from functools import wraps
 from mimetypes import guess_type
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Lock
 from urllib.parse import parse_qs, quote, urlparse
 from xml.etree import ElementTree
 
@@ -28,8 +33,150 @@ import requests
 HOST = "127.0.0.1"
 PORT = 8000
 USER_AGENT = "Mozilla/5.0 (compatible; StockProjectionDashboard/1.0)"
+DB_PATH = os.path.join(os.path.dirname(__file__), "delve_cache.sqlite3")
+DEMO_SYMBOLS = (
+    ("MSFT", "Microsoft"),
+    ("SOXL", "Direxion Semiconductor Bull 3X ETF"),
+    ("AAPL", "Apple"),
+    ("FIG", "Figma"),
+    ("NVDA", "NVIDIA"),
+    ("AMZN", "Amazon"),
+    ("GOOGL", "Alphabet"),
+    ("META", "Meta Platforms"),
+    ("TSLA", "Tesla"),
+)
+CACHE_TTLS = {
+    "yahoo_history": 6 * 60 * 60,
+    "google_quote": 5 * 60,
+    "alpha_news": 30 * 60,
+    "finnhub": 30 * 60,
+    "publisher_commentary": 60 * 60,
+}
+_DATABASE_INIT_LOCK = Lock()
+_INITIALIZED_DATABASES: set[str] = set()
 
 
+# Open database
+def database_connection() -> sqlite3.Connection:
+    """Open a short-lived SQLite connection safe for threaded requests."""
+    connection = sqlite3.connect(DB_PATH, timeout=10)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+# Initialize database
+def initialize_database() -> None:
+    """Create cache and demo-symbol tables when they do not exist."""
+    database_path = os.path.abspath(DB_PATH)
+    if database_path in _INITIALIZED_DATABASES:
+        return
+    with _DATABASE_INIT_LOCK:
+        if database_path in _INITIALIZED_DATABASES:
+            return
+        with database_connection() as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cache_entries (
+                    namespace TEXT NOT NULL,
+                    cache_key TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (namespace, cache_key)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS demo_symbols (
+                    symbol TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    sort_order INTEGER NOT NULL
+                )
+                """
+            )
+            connection.executemany(
+                """
+                INSERT INTO demo_symbols (symbol, display_name, sort_order)
+                VALUES (?, ?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    sort_order = excluded.sort_order
+                """,
+                [(symbol, name, index) for index, (symbol, name) in enumerate(DEMO_SYMBOLS)],
+            )
+        _INITIALIZED_DATABASES.add(database_path)
+
+
+# Read cache
+def read_cache(namespace: str, cache_key: str, max_age_seconds: int | None) -> object | None:
+    """Return a cached JSON value when present and sufficiently fresh."""
+    initialize_database()
+    with database_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT payload_json, updated_at
+            FROM cache_entries
+            WHERE namespace = ? AND cache_key = ?
+            """,
+            (namespace, cache_key),
+        ).fetchone()
+    if row is None:
+        return None
+    if max_age_seconds is not None and int(time.time()) - int(row["updated_at"]) > max_age_seconds:
+        return None
+    try:
+        return json.loads(str(row["payload_json"]))
+    except json.JSONDecodeError:
+        return None
+
+
+# Write cache
+def write_cache(namespace: str, cache_key: str, payload: object) -> None:
+    """Store a JSON-serializable value with its refresh timestamp."""
+    initialize_database()
+    with database_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO cache_entries (namespace, cache_key, payload_json, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(namespace, cache_key) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at
+            """,
+            (namespace, cache_key, json.dumps(payload), int(time.time())),
+        )
+
+
+# Cache calls
+def cached_json(namespace: str, key_builder, should_cache=lambda result: True):
+    """Cache provider calls and use stale data during temporary failures."""
+    # Build decorator
+    def decorator(function):
+        # Wrap call
+        @wraps(function)
+        def wrapper(*args, **kwargs):
+            cache_key = str(key_builder(*args, **kwargs))
+            fresh = read_cache(namespace, cache_key, CACHE_TTLS[namespace])
+            if fresh is not None:
+                return fresh
+            stale = read_cache(namespace, cache_key, None)
+            try:
+                result = function(*args, **kwargs)
+            except Exception:
+                if stale is not None:
+                    return stale
+                raise
+            if should_cache(result):
+                write_cache(namespace, cache_key, result)
+            elif stale is not None:
+                return stale
+            return result
+        return wrapper
+    return decorator
+
+
+# Load environment
 def load_local_env() -> None:
     """Load local API configuration without adding a third-party dependency."""
     env_path = os.path.join(os.path.dirname(__file__), ".env")
@@ -44,10 +191,12 @@ def load_local_env() -> None:
 
 
 load_local_env()
+DB_PATH = os.getenv("DELVE_DB_PATH", DB_PATH)
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
 
 
+# Filter headlines
 def usable_headline(value: object) -> str | None:
     """Return a displayable headline, excluding provider template markers."""
     title = str(value or "").strip()
@@ -56,6 +205,8 @@ def usable_headline(value: object) -> str | None:
     return title
 
 
+# Fetch history
+@cached_json("yahoo_history", lambda ticker, period: f"{ticker.upper()}:{period}")
 def yahoo_chart(ticker: str, period: str) -> tuple[str, list[dict[str, float | str]], dict[str, object]]:
     """Fetch historical daily closes from Yahoo Finance's public chart feed."""
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(ticker)}"
@@ -80,6 +231,7 @@ def yahoo_chart(ticker: str, period: str) -> tuple[str, list[dict[str, float | s
     return meta.get("longName") or meta.get("shortName") or ticker.upper(), prices, meta
 
 
+# Parse quote
 def yahoo_structured_quote(meta: dict[str, object]) -> dict[str, float | str | int | None]:
     """Return the ticker-scoped regular-market quote from Yahoo chart metadata.
 
@@ -98,6 +250,12 @@ def yahoo_structured_quote(meta: dict[str, object]) -> dict[str, float | str | i
     }
 
 
+# Fetch quote
+@cached_json(
+    "google_quote",
+    lambda ticker, yahoo_exchange: f"{ticker.upper()}:{yahoo_exchange}",
+    lambda result: isinstance(result, dict),
+)
 def google_finance_quote(ticker: str, yahoo_exchange: str) -> dict[str, float | str | bool | None]:
     """Scrape the visible last-price attribute from Google Finance.
 
@@ -141,6 +299,12 @@ def google_finance_quote(ticker: str, yahoo_exchange: str) -> dict[str, float | 
     return {"market_price": None, "source": "Google Finance price unavailable", "validated": False}
 
 
+# Fetch news
+@cached_json(
+    "alpha_news",
+    lambda ticker, company_name="", limit=8: f"{ticker.upper()}:{limit}",
+    lambda result: isinstance(result, dict),
+)
 def alpha_vantage_news(ticker: str, company_name: str = "", limit: int = 8) -> dict[str, object]:
     """Read Alpha Vantage's ticker-scored market-news feed."""
     ticker = ticker.upper()
@@ -191,6 +355,12 @@ def alpha_vantage_news(ticker: str, company_name: str = "", limit: int = 8) -> d
         return {"items": [], "status": "API request unavailable", "source": "Alpha Vantage"}
 
 
+# Fetch data
+@cached_json(
+    "finnhub",
+    lambda ticker, limit=8: f"{ticker.upper()}:{limit}",
+    lambda result: isinstance(result, dict) and result.get("news_status") == "ok",
+)
 def finnhub_data(ticker: str, limit: int = 8) -> dict[str, object]:
     """Read Finnhub company news and report aggregate-sentiment availability.
 
@@ -238,6 +408,7 @@ def finnhub_data(ticker: str, limit: int = 8) -> dict[str, object]:
         return {"items": [], "aggregate": {}, "news_status": "API request unavailable", "sentiment_status": "API request unavailable", "source": "Finnhub"}
 
 
+# Summarize sentiment
 def provider_summary(alpha: dict[str, object], finnhub: dict[str, object]) -> str:
     """Summarize provider-supplied scores, never classify raw user text."""
     alpha_items = alpha.get("items", [])
@@ -253,6 +424,7 @@ def provider_summary(alpha: dict[str, object], finnhub: dict[str, object]) -> st
     return f"Alpha Vantage's relevance-weighted article scores are {alpha_view} across {len(alpha_items)} items. {finnhub_view}. This combines provider-supplied news signals, not raw keyword matching, and is not financial advice."
 
 
+# Fetch headlines
 def news_feed(ticker: str, limit: int = 6) -> dict[str, object]:
     """Fetch recent, linked Google News RSS headlines for the ticker."""
     try:
@@ -282,6 +454,12 @@ def news_feed(ticker: str, limit: int = 6) -> dict[str, object]:
         return {"items": [], "source": "Google News RSS"}
 
 
+# Fetch commentary
+@cached_json(
+    "publisher_commentary",
+    lambda ticker, limit_per_source=3: f"{ticker.upper()}:{limit_per_source}",
+    lambda result: isinstance(result, dict),
+)
 def publisher_commentary_feed(ticker: str, limit_per_source: int = 3) -> dict[str, object]:
     """Link publicly indexed publisher coverage without scraping social posts."""
     publishers = {
@@ -290,6 +468,7 @@ def publisher_commentary_feed(ticker: str, limit_per_source: int = 3) -> dict[st
         "Benzinga": "benzinga.com",
         "Seeking Alpha": "seekingalpha.com",
     }
+    # Fetch publisher
     def fetch_publisher(publisher: str, domain: str) -> list[dict[str, str]]:
         try:
             response = requests.get("https://news.google.com/rss/search", params={"q": f"{ticker} stock site:{domain}", "hl": "en-US", "gl": "US", "ceid": "US:en"}, headers={"User-Agent": USER_AGENT}, timeout=12)
@@ -312,6 +491,7 @@ def publisher_commentary_feed(ticker: str, limit_per_source: int = 3) -> dict[st
     return {"items": items, "source": "Publisher links via Google News RSS", "publishers": list(publishers)}
 
 
+# Summarize sources
 def contextual_analysis(news: dict[str, object], finnhub: dict[str, object], commentary: dict[str, object]) -> list[str]:
     """Summarize source availability without labeling text as positive/negative."""
     news_items = news.get("items", [])
@@ -325,6 +505,7 @@ def contextual_analysis(news: dict[str, object], finnhub: dict[str, object], com
     ]
 
 
+# Project prices
 def make_projection(prices: list[dict[str, float | str]], days: int = 30) -> dict[str, object]:
     """Forecast 30 trading days with shrunk-drift GBM and empirical volatility.
 
@@ -346,8 +527,10 @@ def make_projection(prices: list[dict[str, float | str]], days: int = 30) -> dic
     raw_log_drift = float(np.mean(log_returns))
     prior_observations = 252
     shrunken_log_drift = raw_log_drift * len(log_returns) / (len(log_returns) + prior_observations)
-    # GBM's arithmetic drift converts the estimated log-return drift into the
+
+    # model's arithmetic drift converts the estimated log-return drift into the
     # expected-price path while retaining a log-normal forecast distribution.
+
     arithmetic_drift = shrunken_log_drift + 0.5 * daily_volatility**2
     z_score = 1.645  # central 90% interval under the log-normal GBM model
     start_date = datetime.strptime(str(prices[-1]["date"]), "%Y-%m-%d").date()
@@ -357,7 +540,9 @@ def make_projection(prices: list[dict[str, float | str]], days: int = 30) -> dic
         date += timedelta(days=1)
         while date.weekday() >= 5:
             date += timedelta(days=1)
+
         # GBM quantiles widen at the empirical sigma * sqrt(time).
+
         spread = daily_volatility * math.sqrt(trading_day)
         expected_price = latest_close * math.exp(arithmetic_drift * trading_day)
         forecast.append(
@@ -378,6 +563,7 @@ def make_projection(prices: list[dict[str, float | str]], days: int = 30) -> dic
     }
 
 
+# Assemble dashboard
 def dashboard_data(ticker: str, period: str, days: int) -> dict[str, object]:
     ticker = ticker.strip().upper()
     if not re.fullmatch(r"[A-Z0-9.^-]{1,15}", ticker):
@@ -456,6 +642,62 @@ def dashboard_data(ticker: str, period: str, days: int) -> dict[str, object]:
     }
 
 
+# Cache overview
+def cache_overview() -> dict[str, object]:
+    """Return cache counts and configured demonstration symbols."""
+    initialize_database()
+    with database_connection() as connection:
+        cache_rows = connection.execute(
+            """
+            SELECT namespace, COUNT(*) AS entry_count, MAX(updated_at) AS newest_at
+            FROM cache_entries
+            GROUP BY namespace
+            ORDER BY namespace
+            """
+        ).fetchall()
+        symbol_rows = connection.execute(
+            """
+            SELECT symbol, display_name
+            FROM demo_symbols
+            ORDER BY sort_order
+            """
+        ).fetchall()
+    return {
+        "database": os.path.basename(DB_PATH),
+        "demo_symbols": [dict(row) for row in symbol_rows],
+        "cache": [
+            {
+                "namespace": row["namespace"],
+                "entries": row["entry_count"],
+                "newest_at": datetime.fromtimestamp(int(row["newest_at"]), tz=timezone.utc).isoformat(),
+            }
+            for row in cache_rows
+        ],
+    }
+
+
+# Seed database
+def seed_demo_cache(periods: tuple[str, ...] = ("6mo", "1y", "2y")) -> dict[str, object]:
+    """Populate the local cache for the configured demonstration symbols."""
+    initialize_database()
+    started_at = time.perf_counter()
+    refreshed = []
+    failures = []
+    for symbol, _ in DEMO_SYMBOLS:
+        for period in periods:
+            try:
+                dashboard_data(symbol, period, 30)
+                refreshed.append({"symbol": symbol, "period": period})
+            except (ValueError, KeyError, IndexError, requests.RequestException) as error:
+                failures.append({"symbol": symbol, "period": period, "error": str(error)})
+    return {
+        "refreshed": refreshed,
+        "failures": failures,
+        "elapsed_seconds": round(time.perf_counter() - started_at, 2),
+        "overview": cache_overview(),
+    }
+
+
 HTML = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Delve — Stock Research Dashboard</title>
@@ -469,6 +711,7 @@ body{color:#fff;text-shadow:0 1px 10px rgba(56,28,53,.2)}.shell{position:relativ
 <div id="error" class="error"></div><section id="results" hidden><div class="grid"><div class="card"><div class="label">Latest close</div><div class="value" id="close">—</div><div class="muted" id="asof">—</div></div><div class="card"><div class="label">30-day expected return</div><div class="value" id="return">—</div><div class="muted" id="drift">Volatility-shrunk historical drift</div></div><div class="card"><div class="label">Annualized volatility</div><div class="value" id="volatility">—</div><div class="muted" id="source">—</div></div></div><div class="chart-box"><canvas id="chart"></canvas></div><section class="insight research"><h2>Reported-sentiment summary</h2><p id="article-summary" class="summary">Reading public article text…</p><div id="articles-read" class="muted"></div></section><div class="insights"><section class="insight"><h2>Price-source check</h2><div class="source-row"><span>Yahoo Finance</span><span id="yahoo-price" class="source-price">—</span></div><div class="source-row"><span>Google Finance</span><span id="google-price" class="source-price">—</span></div><div id="price-difference" class="muted">Comparing sources…</div><div id="quote-validation" class="muted" role="status"></div></section><section class="insight"><h2>Recent news sources</h2><div id="headlines" class="headlines"></div><div id="news-empty" class="muted" hidden>No current headlines available from Google News RSS.</div></section></div><section class="insight research"><h2>Cross-source research</h2><ul id="analysis" class="analysis-list"></ul><div class="research-grid"><div><h3>MarketWatch reporting</h3><div id="marketwatch" class="headlines"></div><div id="marketwatch-empty" class="muted" hidden>No recent MarketWatch headlines found.</div></div><div><h3>StockTwits community <span id="stocktwits-sentiment" class="sentiment">—</span></h3><div id="stocktwits" class="headlines"></div><div id="stocktwits-empty" class="muted" hidden>No public StockTwits posts available.</div></div></div></section><p class="note">Projection model: 30-trading-day geometric Brownian motion. The midpoint uses the stock's average daily log return from up to 252 sessions, shrunk toward zero with a zero-return prior equal to 252 observations; this keeps the forecast responsive but avoids extending a recent move unchecked. The central 90% interval is calculated from the stock's actual daily return volatility and widens with √time. The reported-sentiment summary is generated only from public full text that can be read from the linked articles; it is not financial advice. StockTwits labels are supplied by post authors. Historical data: Yahoo Finance structured regular-market quote; comparison quote: Google Finance only after ticker/exchange validation. A gap above 2% triggers a validation alert.</p></section><div id="loading" class="loading" aria-live="polite">Loading market data…</div></main>
 <script>
 const themeOverrides=document.createElement('style');themeOverrides.textContent="#sentiment{display:block!important;background:rgba(255,255,255,.14)!important;color:#fff!important;border:1px solid rgba(255,255,255,.34);border-radius:12px;padding:16px!important;line-height:1.55}.headline,.post{border-color:rgba(255,255,255,.42)!important}.show-more{margin-top:13px;padding:8px 13px;border:1px solid rgba(255,255,255,.58);border-radius:999px;background:rgba(255,255,255,.2);color:#fff;font:inherit;font-size:.84rem;font-weight:700;cursor:pointer}.show-more:hover{background:rgba(255,255,255,.34)}";document.head.append(themeOverrides);
+themeOverrides.textContent+='body{background-color:rgba(45,31,43,.18);background-blend-mode:multiply}';
 themeOverrides.textContent+='@keyframes floatBubble{0%,100%{transform:translate3d(0,0,0) rotate(0deg)}50%{transform:translate3d(4vw,-5vh,0) rotate(8deg)}}.bubbles{position:fixed;inset:0;z-index:0;overflow:hidden;pointer-events:none}.bubble{position:absolute;width:clamp(150px,22vw,340px);aspect-ratio:1;background:center/contain no-repeat;opacity:.35;filter:drop-shadow(0 12px 20px rgba(116,50,87,.18));animation:floatBubble 12s ease-in-out infinite}.bubble-one{background-image:url("/assets/bubbles1.png");left:4%;top:20%;animation-delay:-2s}.bubble-two{background-image:url("/assets/bubbles2.png");right:6%;top:40%;width:clamp(120px,18vw,270px);animation-duration:15s;animation-delay:-7s}.bubble-three{background-image:url("/assets/bubbles3.png");left:28%;bottom:4%;width:clamp(100px,15vw,220px);animation-duration:18s;animation-delay:-11s}.shell{z-index:1}.headline,.post{max-height:18rem;overflow:hidden;opacity:1;transition:max-height .36s ease,opacity .22s ease,padding .3s ease,border-width .3s ease}[hidden]{display:block!important;max-height:0!important;opacity:0!important;padding-top:0!important;border-top-width:0!important;pointer-events:none!important}';
 const bubbles=document.createElement('div');bubbles.className='bubbles';bubbles.setAttribute('aria-hidden','true');bubbles.innerHTML='<i class="bubble bubble-one"></i><i class="bubble bubble-two"></i><i class="bubble bubble-three"></i>';document.body.prepend(bubbles);
 document.querySelector('.insight.research h2').textContent='Check This Out';
@@ -499,9 +742,11 @@ new MutationObserver(()=>publisherArticles.querySelectorAll('.post').forEach(row
 
 
 class AppHandler(BaseHTTPRequestHandler):
+    # Log request
     def log_message(self, fmt: str, *args: object) -> None:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {fmt % args}")
 
+    # Send JSON
     def send_json(self, status: int, payload: dict[str, object]) -> None:
         encoded = json.dumps(payload).encode("utf-8")
         self.send_response(status)
@@ -510,6 +755,7 @@ class AppHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    # Handle GET
     def do_GET(self) -> None:
         request = urlparse(self.path)
         if request.path == "/":
@@ -548,10 +794,17 @@ class AppHandler(BaseHTTPRequestHandler):
                 stock_name = ticker or "that stock"
                 self.send_json(400, {"error": f"Are you sure you've entered this in right? - {stock_name}"})
             return
+        if request.path == "/api/cache":
+            self.send_json(200, cache_overview())
+            return
         self.send_error(404, "Not found")
 
 
 if __name__ == "__main__":
+    initialize_database()
+    if "--seed-cache" in sys.argv:
+        print(json.dumps(seed_demo_cache(), indent=2))
+        raise SystemExit(0)
     server = ThreadingHTTPServer((HOST, PORT), AppHandler)
     print(f"Delve is running at http://{HOST}:{PORT}")
     try:

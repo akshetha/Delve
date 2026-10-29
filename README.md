@@ -20,6 +20,27 @@ python3 delve.py
 When you see `Delve is running`, open [http://127.0.0.1:8000](http://127.0.0.1:8000)
 in your browser. Stop the app at any time with `Ctrl+C` in the terminal.
 
+## Local database cache
+
+Delve uses a local SQLite database named `delve_cache.sqlite3` to reduce repeat
+API requests and make demonstrations load quickly. The database stores Yahoo
+history, validated Google quotes, Alpha Vantage news, Finnhub data, and public
+publisher links. Price quotes refresh after 5 minutes, news after 30–60 minutes,
+and historical price series after 6 hours. If a provider is temporarily
+unavailable, Delve can fall back to its most recent cached response.
+
+Preload all three history periods for the nine demonstration symbols with:
+
+```bash
+python3 delve.py --seed-cache
+```
+
+The demonstration list contains `MSFT`, `SOXL`, `AAPL`, `FIG`, `NVDA`, `AMZN`,
+`GOOGL`, `META`, and `TSLA`. `SOXL` is a leveraged exchange-traded fund rather
+than an individual company stock. Cache counts and refresh timestamps are
+available locally at [http://127.0.0.1:8000/api/cache](http://127.0.0.1:8000/api/cache).
+The generated database is intentionally excluded from Git.
+
 ## Optional: API keys
 
 Delve works without API keys for price history and public news links. To add
