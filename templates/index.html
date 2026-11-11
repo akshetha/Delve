@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Delve — Stock Research Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <div class="bubbles" aria-hidden="true">
+      <i class="bubble bubble-one"></i>
+      <i class="bubble bubble-two"></i>
+      <i class="bubble bubble-three"></i>
+    </div>
+    <main class="shell">
+      <header>
+        <div class="eyebrow">Your market research tool</div>
+        <h1>Delve</h1>
+        <p class="sub">Gathers recent market data and turns its current trend into a clear price projection. Use it to explore ideas. Learn to your heart's content!</p>
+      </header>
+
+      <form class="controls" id="form">
+        <input id="ticker" value="AAPL" aria-label="Ticker symbol" maxlength="15">
+        <select id="period" aria-label="History period">
+          <option value="6mo">6 months of history</option>
+          <option value="1y" selected>1 year of history</option>
+          <option value="2y">2 years of history</option>
+        </select>
+        <div class="horizon" aria-label="Projection horizon">30 trading-day projection</div>
+        <button>Analyze stock</button>
+      </form>
+
+      <div id="error" class="error"></div>
+      <section id="results" hidden>
+        <div class="grid">
+          <div class="card"><div class="label">Latest close</div><div class="value" id="close">—</div><div class="muted" id="asof">—</div></div>
+          <div class="card"><div class="label">30-day expected return</div><div class="value" id="return">—</div><div class="muted" id="drift">Volatility-shrunk historical drift</div></div>
+          <div class="card"><div class="label">Annualized volatility</div><div class="value" id="volatility">—</div><div class="muted" id="source">—</div></div>
+        </div>
+        <div class="chart-box"><canvas id="chart"></canvas></div>
+        <section class="insight research"><h2>Check This Out</h2><p id="sentiment" class="summary">Reading public article text…</p></section>
+        <div class="insights">
+          <section class="insight">
+            <h2>Price-source check</h2>
+            <div class="source-row"><span>Yahoo Finance</span><span id="yahoo-price" class="source-price">—</span></div>
+            <div class="source-row"><span>Google Finance</span><span id="google-price" class="source-price">—</span></div>
+            <div id="price-difference" class="muted">Comparing sources…</div>
+            <div id="quote-validation" class="muted" role="status"></div>
+          </section>
+          <section class="insight">
+            <h2>Alpha Vantage scored news</h2>
+            <div id="headlines" class="headlines"></div>
+            <div id="news-empty" class="muted" hidden>No current headlines available from Google News RSS.</div>
+          </section>
+        </div>
+        <section class="insight research">
+          <h2>Cross-source research</h2>
+          <ul id="analysis" class="analysis-list"></ul>
+          <div class="research-grid">
+            <div><h3>Finnhub company news</h3><div id="marketwatch" class="headlines"></div><div id="marketwatch-empty" class="muted" hidden>No recent Finnhub headlines found.</div></div>
+            <div><h3>Publisher commentary <span id="stocktwits-sentiment" class="sentiment">—</span></h3><div id="stocktwits" class="headlines"></div><div id="stocktwits-empty" class="muted" hidden>No public publisher articles available.</div></div>
+          </div>
+        </section>
+        <p class="note">How Delve estimates: the chart uses a stock's recent price history to estimate what its next 30 trading days could look like. The shaded range shows how wide the outcome could be based on the stock's past ups and downs. News notes use only readable public articles, and publisher links come from public search results. Prices are checked against Yahoo Finance and Google Finance when possible. If they differ by more than 2%, Delve flags it for you to review. This is for research only, not financial advice.</p>
+      </section>
+      <div id="loading" class="loading" aria-live="polite">Loading market data…</div>
+    </main>
+  </body>
+</html>

@@ -20,6 +20,14 @@ python3 delve.py
 When you see `Delve is running`, open [http://127.0.0.1:8000](http://127.0.0.1:8000)
 in your browser. Stop the app at any time with `Ctrl+C` in the terminal.
 
+## Project layout
+
+- `delve.py` runs the local server, data collection, cache, and forecast logic.
+- `templates/index.html` contains the dashboard markup.
+- `static/styles.css` contains the visual design.
+- `static/app.js` loads stock data and renders the chart and news lists.
+- `assets/` holds the background and bubble images.
+
 ## Local database cache
 
 Delve uses a local SQLite database named `delve_cache.sqlite3` to reduce repeat
